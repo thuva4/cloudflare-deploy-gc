@@ -1,0 +1,183 @@
+name: "Purge Cloudflare Deployments"
+description: "Delete old Cloudflare Pages or Workers deployments, keeping a configurable number of recent ones"
+
+branding:
+  icon: "delete"
+  color: "gray-dark"
+
+inputs:
+  api-token:
+    description: "Cloudflare API token"
+    required: true
+  account-id:
+    description: "Cloudflare account ID"
+    required: true
+  service-type:
+    description: "Type of service: 'pages' or 'workers'"
+    required: true
+  project-name:
+    description: "Cloudflare Pages project name (required when service-type is 'pages')"
+    required: false
+  script-name:
+    description: "Cloudflare Workers script name (required when service-type is 'workers')"
+    required: false
+  keep:
+    description: "Number of most recent deployments to keep"
+    required: false
+    default: "5"
+  dry-run:
+    description: "If true, only list deployments that would be deleted without deleting them"
+    required: false
+    default: "false"
+
+outputs:
+  deleted-count:
+    description: "Number of deployments deleted"
+    value: ${{ steps.purge.outputs.deleted_count }}
+  kept-count:
+    description: "Number of deployments kept"
+    value: ${{ steps.purge.outputs.kept_count }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Purge old deployments
+      id: purge
+      shell: bash
+      env:
+        CF_API_TOKEN: ${{ inputs.api-token }}
+        CF_ACCOUNT_ID: ${{ inputs.account-id }}
+        CF_SERVICE_TYPE: ${{ inputs.service-type }}
+        CF_PROJECT_NAME: ${{ inputs.project-name }}
+        CF_SCRIPT_NAME: ${{ inputs.script-name }}
+        KEEP: ${{ inputs.keep }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        set -euo pipefail
+
+        # Build the base URL and jq path based on service type
+        if [ "${CF_SERVICE_TYPE}" = "pages" ]; then
+          if [ -z "${CF_PROJECT_NAME}" ]; then
+            echo "::error::project-name is required when service-type is 'pages'"
+            exit 1
+          fi
+          BASE_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PROJECT_NAME}/deployments"
+          JQ_PAGE_ITEMS='.result'
+          DELETE_SUFFIX="?force=true"
+          echo "Fetching deployments for Pages project: ${CF_PROJECT_NAME}"
+        elif [ "${CF_SERVICE_TYPE}" = "workers" ]; then
+          if [ -z "${CF_SCRIPT_NAME}" ]; then
+            echo "::error::script-name is required when service-type is 'workers'"
+            exit 1
+          fi
+          BASE_URL="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/workers/scripts/${CF_SCRIPT_NAME}/deployments"
+          JQ_PAGE_ITEMS='.result.deployments'
+          DELETE_SUFFIX=""
+          echo "Fetching deployments for Workers script: ${CF_SCRIPT_NAME}"
+        else
+          echo "::error::service-type must be 'pages' or 'workers', got '${CF_SERVICE_TYPE}'"
+          exit 1
+        fi
+
+        # Fetch all deployments with pagination
+        echo "[]" > /tmp/cf_all_deployments.json
+        page=1
+
+        while true; do
+          echo "Fetching page ${page}..."
+          http_code=$(curl -s -o /tmp/cf_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${BASE_URL}?page=${page}&per_page=25")
+          response=$(cat /tmp/cf_response.json)
+
+          if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 300 ]; then
+            echo "::error::Cloudflare API returned HTTP ${http_code}"
+            echo "${response}" | jq . 2>/dev/null || echo "${response}"
+            exit 1
+          fi
+
+          # Extract deployment items from this page
+          page_items=$(echo "${response}" | jq -c "${JQ_PAGE_ITEMS} // []")
+          page_count=$(echo "${page_items}" | jq 'length')
+
+          if [ "${page_count}" -eq 0 ]; then
+            break
+          fi
+
+          # Merge into collected deployments
+          jq -s '.[0] + .[1]' /tmp/cf_all_deployments.json <(echo "${page_items}") > /tmp/cf_all_merged.json
+          mv /tmp/cf_all_merged.json /tmp/cf_all_deployments.json
+
+          echo "  Fetched ${page_count} deployment(s) from page ${page}"
+
+          # Check if there are more pages
+          total_count=$(echo "${response}" | jq -r '.result_info.total_count // empty')
+          if [ -n "${total_count}" ]; then
+            fetched=$(jq 'length' /tmp/cf_all_deployments.json)
+            if [ "${fetched}" -ge "${total_count}" ]; then
+              break
+            fi
+          else
+            # No pagination info (Workers API) — single page
+            break
+          fi
+
+          page=$((page + 1))
+        done
+
+        # Sort all deployments by created_on (newest first) and extract IDs
+        deployment_ids=$(jq -r 'sort_by(.created_on) | reverse | .[].id' /tmp/cf_all_deployments.json)
+
+        total=$(echo "${deployment_ids}" | grep -c . || true)
+        echo "Found ${total} total deployment(s)"
+
+        if [ "${total}" -le "${KEEP}" ]; then
+          echo "Nothing to purge (${total} deployments, keeping ${KEEP})"
+          echo "deleted_count=0" >> "$GITHUB_OUTPUT"
+          echo "kept_count=${total}" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # IDs to delete (skip the first $KEEP)
+        to_delete=$(echo "${deployment_ids}" | tail -n +"$((KEEP + 1))")
+        delete_count=$(echo "${to_delete}" | grep -c . || true)
+
+        echo "Keeping ${KEEP} most recent deployment(s), deleting ${delete_count}"
+
+        if [ "${DRY_RUN}" = "true" ]; then
+          echo "--- DRY RUN --- The following deployments would be deleted:"
+          echo "${to_delete}"
+          echo "deleted_count=0" >> "$GITHUB_OUTPUT"
+          echo "kept_count=${total}" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        deleted=0
+        for id in ${to_delete}; do
+          echo "Deleting deployment: ${id}"
+          del_http_code=$(curl -s -o /tmp/cf_del_response.json -w "%{http_code}" -X DELETE \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${BASE_URL}/${id}${DELETE_SUFFIX}")
+          del_response=$(cat /tmp/cf_del_response.json)
+
+          if [ "${del_http_code}" -lt 200 ] || [ "${del_http_code}" -ge 300 ]; then
+            echo "::warning::Failed to delete deployment ${id} (HTTP ${del_http_code})"
+            echo "${del_response}" | jq . 2>/dev/null || echo "${del_response}"
+            continue
+          fi
+
+          success=$(echo "${del_response}" | jq -r '.success')
+          if [ "${success}" = "true" ]; then
+            echo "  Deleted successfully"
+            deleted=$((deleted + 1))
+          else
+            echo "::warning::Failed to delete deployment ${id}"
+            echo "${del_response}" | jq '.errors'
+          fi
+        done
+
+        echo "Purge complete: deleted ${deleted}/${delete_count} deployment(s)"
+        echo "deleted_count=${deleted}" >> "$GITHUB_OUTPUT"
+        echo "kept_count=${KEEP}" >> "$GITHUB_OUTPUT"
